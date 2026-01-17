@@ -1,0 +1,151 @@
+#!/bin/bash
+
+# Скрипт автоматического восстановления MariaDB/MySQL
+# Автор: Скрипт для восстановления при сбое базы данных
+
+# ==============================================
+# НАСТРОЙКИ - ИЗМЕНИТЕ ПОД СВОИ ПАРАМЕТРЫ
+# ==============================================
+
+BACKUP_FILE="/path/to/your/backup.sql"          # Путь к файлу бэкапа
+DATABASE_NAME="your_database_name"               # Имя базы данных
+MYSQL_ROOT_PASSWORD="your_root_password"         # Пароль root MySQL
+MYSQL_DATA_DIR="/var/lib/mysql"                  # Директория данных MySQL
+LOG_FILE="/var/log/mysql_auto_restore.log"      # Лог файл
+EMAIL_ALERT="admin@example.com"                  # Email для уведомлений (опционально)
+
+# ==============================================
+# ФУНКЦИИ
+# ==============================================
+
+log_message() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
+
+send_email_alert() {
+    if command -v mail &> /dev/null && [ -n "$EMAIL_ALERT" ]; then
+        echo "$1" | mail -s "MySQL Auto-Restore Alert" "$EMAIL_ALERT"
+    fi
+}
+
+check_mysql_status() {
+    systemctl is-active --quiet mariadb
+    return $?
+}
+
+reinitialize_mysql() {
+    log_message "Начинаем переинициализацию MySQL..."
+    
+    # Останавливаем MySQL
+    log_message "Остановка MySQL..."
+    systemctl stop mariadb
+    sleep 3
+    
+    # Резервная копия старых данных
+    if [ -d "$MYSQL_DATA_DIR" ] && [ "$(ls -A $MYSQL_DATA_DIR)" ]; then
+        BACKUP_DIR="${MYSQL_DATA_DIR}.broken.$(date +%Y%m%d_%H%M%S)"
+        log_message "Создание резервной копии поврежденных данных в $BACKUP_DIR..."
+        mv "$MYSQL_DATA_DIR" "$BACKUP_DIR"
+    fi
+    
+    # Создаем чистую директорию
+    log_message "Создание чистой директории данных..."
+    mkdir -p "$MYSQL_DATA_DIR"
+    chown mysql:mysql "$MYSQL_DATA_DIR"
+    chmod 755 "$MYSQL_DATA_DIR"
+    
+    # Инициализация новой базы
+    log_message "Инициализация новой базы данных..."
+    mysql_install_db --user=mysql --datadir="$MYSQL_DATA_DIR" &>> "$LOG_FILE"
+    
+    if [ $? -ne 0 ]; then
+        log_message "ОШИБКА: Не удалось инициализировать базу данных!"
+        send_email_alert "КРИТИЧЕСКАЯ ОШИБКА: Не удалось переинициализировать MySQL на $(hostname)"
+        return 1
+    fi
+    
+    # Запуск MySQL
+    log_message "Запуск MySQL..."
+    systemctl start mariadb
+    sleep 5
+    
+    if ! check_mysql_status; then
+        log_message "ОШИБКА: MySQL не запустился после переинициализации!"
+        send_email_alert "КРИТИЧЕСКАЯ ОШИБКА: MySQL не запустился после восстановления на $(hostname)"
+        return 1
+    fi
+    
+    log_message "MySQL успешно переинициализирован и запущен"
+    return 0
+}
+
+restore_from_backup() {
+    log_message "Начинаем восстановление из бэкапа..."
+    
+    if [ ! -f "$BACKUP_FILE" ]; then
+        log_message "ОШИБКА: Файл бэкапа не найден: $BACKUP_FILE"
+        send_email_alert "ОШИБКА: Файл бэкапа не найден на $(hostname): $BACKUP_FILE"
+        return 1
+    fi
+    
+    # Ждем полного запуска MySQL
+    sleep 5
+    
+    # Создаем базу данных
+    log_message "Создание базы данных $DATABASE_NAME..."
+    mysql -u root -p"$MYSQL_ROOT_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS $DATABASE_NAME;" &>> "$LOG_FILE"
+    
+    # Восстанавливаем из бэкапа
+    log_message "Восстановление данных из бэкапа..."
+    mysql -u root -p"$MYSQL_ROOT_PASSWORD" "$DATABASE_NAME" < "$BACKUP_FILE" 2>> "$LOG_FILE"
+    
+    if [ $? -eq 0 ]; then
+        log_message "Данные успешно восстановлены из бэкапа"
+        send_email_alert "SUCCESS: MySQL восстановлен из бэкапа на $(hostname)"
+        return 0
+    else
+        log_message "ОШИБКА: Не удалось восстановить данные из бэкапа"
+        send_email_alert "ОШИБКА: Не удалось восстановить данные из бэкапа на $(hostname)"
+        return 1
+    fi
+}
+
+# ==============================================
+# ОСНОВНАЯ ЛОГИКА
+# ==============================================
+
+main() {
+    log_message "=========================================="
+    log_message "Запуск скрипта автоматического восстановления MySQL"
+    log_message "=========================================="
+    
+    # Проверяем статус MySQL
+    if check_mysql_status; then
+        log_message "MySQL работает нормально. Восстановление не требуется."
+        exit 0
+    fi
+    
+    log_message "ВНИМАНИЕ: MySQL не работает! Начинаем автоматическое восстановление..."
+    send_email_alert "ВНИМАНИЕ: Обнаружен сбой MySQL на $(hostname). Начинается автоматическое восстановление."
+    
+    # Переинициализация MySQL
+    if ! reinitialize_mysql; then
+        log_message "Не удалось переинициализировать MySQL. Прекращение работы."
+        exit 1
+    fi
+    
+    # Восстановление из бэкапа
+    if ! restore_from_backup; then
+        log_message "Не удалось восстановить данные из бэкапа."
+        exit 1
+    fi
+    
+    log_message "=========================================="
+    log_message "Автоматическое восстановление MySQL завершено успешно!"
+    log_message "=========================================="
+    
+    exit 0
+}
+
+# Запуск основной функции
+main

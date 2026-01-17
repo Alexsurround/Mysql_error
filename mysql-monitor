@@ -1,0 +1,54 @@
+# ============================================
+# ФАЙЛ 1: /etc/systemd/system/mysql-monitor.service
+# ============================================
+
+[Unit]
+Description=MySQL Auto-Restore Monitor Service
+After=mariadb.service
+Wants=mariadb.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/mysql_auto_restore.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+
+
+# ============================================
+# ФАЙЛ 2: /etc/systemd/system/mysql-monitor.timer
+# ============================================
+
+[Unit]
+Description=MySQL Auto-Restore Monitor Timer
+Requires=mysql-monitor.service
+
+[Timer]
+# Проверка каждые 5 минут
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+
+
+# ============================================
+# ФАЙЛ 3: /etc/systemd/system/mariadb-recovery.service
+# (Опционально - запуск при падении MariaDB)
+# ============================================
+
+[Unit]
+Description=MariaDB Auto-Recovery Service
+After=mariadb.service
+BindsTo=mariadb.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+ExecStart=/usr/local/bin/mysql_auto_restore.sh
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,191 @@
+#!/bin/bash
+
+# ==============================================================================
+# Wrapper скрипт для проверки нескольких баз данных MySQL
+# Использует основной скрипт mysql_backup_verify.sh для каждой БД
+# ==============================================================================
+
+# ==============================================
+# НАСТРОЙКИ
+# ==============================================
+
+# Основная директория где Webmin сохраняет все бэкапы
+MAIN_BACKUP_DIR="/data/nfs/backup/mysql-vm"
+
+# Путь к основному скрипту проверки
+VERIFY_SCRIPT="/usr/local/bin/mysql_backup_verify.sh"
+
+# Email для общих уведомлений (опционально)
+EMAIL_ALERT="admin@example.com"
+
+# Максимальный возраст файлов для проверки (в минутах)
+# 180 = 3 часа (рекомендуется для NFS)
+MAX_FILE_AGE=180
+
+# Срок хранения проверенных копий (в днях)
+RETENTION_DAYS=30
+
+# Общий лог файл для wrapper скрипта
+WRAPPER_LOG="/var/log/mysql_backup_verify_all.log"
+
+# ==============================================
+# СПИСОК БАЗ ДАННЫХ ДЛЯ ПРОВЕРКИ
+# ==============================================
+# Формат: "имя_файла_без_расширения"
+# Если Webmin создает файлы: zabbix.sql, nextcloud.sql
+# Укажите здесь: zabbix nextcloud
+
+DATABASES=(
+    "zabbix"
+    "nextcloud"
+    "wordpress"
+    # Добавьте свои базы данных здесь
+)
+
+# ==============================================
+# ФУНКЦИИ
+# ==============================================
+
+log_wrapper() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$WRAPPER_LOG"
+}
+
+send_summary_email() {
+    if [ -n "$EMAIL_ALERT" ] && command -v mail &> /dev/null; then
+        echo "$1" | mail -s "MySQL Backup Verification Summary - $(hostname)" "$EMAIL_ALERT"
+    fi
+}
+
+# Функция для проверки одной базы данных
+verify_database() {
+    local db_name="$1"
+    local backup_dir="$2"
+    
+    log_wrapper "=========================================="
+    log_wrapper "Проверка базы данных: $db_name"
+    log_wrapper "=========================================="
+    
+    # Проверяем что основной скрипт существует
+    if [ ! -x "$VERIFY_SCRIPT" ]; then
+        log_wrapper "ОШИБКА: Скрипт $VERIFY_SCRIPT не найден или не исполняемый!"
+        return 1
+    fi
+    
+    # Настройка переменных окружения для основного скрипта
+    export BACKUP_DIR="$backup_dir"
+    export BACKUP_PATTERN="${db_name}.sql*"  # Поддержка .sql и .sql.gz
+    export ARCHIVE_DIR="${backup_dir}/archive_${db_name}"
+    export LOG_FILE="/var/log/mysql_backup_verify_${db_name}.log"
+    export EMAIL_ALERT="$EMAIL_ALERT"
+    export MAX_FILE_AGE="$MAX_FILE_AGE"
+    export RETENTION_DAYS="$RETENTION_DAYS"
+    
+    # Создаем директорию для архива если не существует
+    mkdir -p "$ARCHIVE_DIR"
+    
+    # Запускаем основной скрипт
+    "$VERIFY_SCRIPT"
+    local result=$?
+    
+    if [ $result -eq 0 ]; then
+        log_wrapper "✓ База данных $db_name: Проверка успешна"
+        return 0
+    else
+        log_wrapper "✗ База данных $db_name: Проверка провалена (код: $result)"
+        return 1
+    fi
+}
+
+# ==============================================
+# ОСНОВНАЯ ЛОГИКА
+# ==============================================
+
+main() {
+    log_wrapper "=========================================="
+    log_wrapper "НАЧАЛО ПРОВЕРКИ ВСЕХ БАЗ ДАННЫХ"
+    log_wrapper "Хост: $(hostname)"
+    log_wrapper "Дата: $(date '+%Y-%m-%d %H:%M:%S')"
+    log_wrapper "Директория бэкапов: $MAIN_BACKUP_DIR"
+    log_wrapper "Количество баз для проверки: ${#DATABASES[@]}"
+    log_wrapper "=========================================="
+    
+    # Проверка что директория существует
+    if [ ! -d "$MAIN_BACKUP_DIR" ]; then
+        log_wrapper "КРИТИЧЕСКАЯ ОШИБКА: Директория $MAIN_BACKUP_DIR не существует!"
+        send_summary_email "КРИТИЧЕСКАЯ ОШИБКА: Директория бэкапов не доступна на $(hostname)"
+        exit 1
+    fi
+    
+    # Счетчики успеха/неудачи
+    local success_count=0
+    local failed_count=0
+    local failed_databases=""
+    
+    # Проверяем каждую базу данных
+    for db in "${DATABASES[@]}"; do
+        # Пропускаем пустые строки и комментарии
+        [[ -z "$db" || "$db" =~ ^# ]] && continue
+        
+        verify_database "$db" "$MAIN_BACKUP_DIR"
+        
+        if [ $? -eq 0 ]; then
+            ((success_count++))
+        else
+            ((failed_count++))
+            failed_databases="${failed_databases}${db}, "
+        fi
+        
+        log_wrapper ""
+    done
+    
+    # Убираем последнюю запятую из списка проваленных БД
+    failed_databases="${failed_databases%, }"
+    
+    # Итоговая статистика
+    log_wrapper "=========================================="
+    log_wrapper "ИТОГИ ПРОВЕРКИ:"
+    log_wrapper "Успешно проверено: $success_count"
+    log_wrapper "Провалено проверок: $failed_count"
+    if [ $failed_count -gt 0 ]; then
+        log_wrapper "Проблемные базы: $failed_databases"
+    fi
+    log_wrapper "=========================================="
+    
+    # Формирование отчета
+    local summary="MySQL Backup Verification Summary
+    
+Хост: $(hostname)
+Дата: $(date '+%Y-%m-%d %H:%M:%S')
+
+РЕЗУЛЬТАТЫ:
+✓ Успешно: $success_count
+✗ Провалено: $failed_count"
+    
+    if [ $failed_count -gt 0 ]; then
+        summary="${summary}
+        
+Проблемные базы данных:
+$failed_databases
+
+ТРЕБУЕТСЯ ВНИМАНИЕ!"
+    else
+        summary="${summary}
+        
+Все базы данных проверены успешно!"
+    fi
+    
+    # Отправка итогового email
+    if [ $failed_count -gt 0 ]; then
+        send_summary_email "$summary"
+        log_wrapper "✗ ЗАВЕРШЕНО С ОШИБКАМИ"
+        exit 1
+    else
+        # Опционально: отправлять email даже при успехе
+        # send_summary_email "$summary"
+        log_wrapper "✓ ВСЕ ПРОВЕРКИ ЗАВЕРШЕНЫ УСПЕШНО"
+        exit 0
+    fi
+}
+
+# Запуск основной функции
+main "$@"

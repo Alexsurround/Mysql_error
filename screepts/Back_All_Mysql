@@ -1,0 +1,248 @@
+#!/bin/bash
+
+# ==============================================================================
+# Скрипт проверки целостности MySQL бэкапа и создания резервной копии
+# Версия: 2.0 - Поддержка проверки отдельных баз данных
+# ==============================================================================
+
+# ==============================================
+# НАСТРОЙКИ - МОГУТ БЫТЬ ПЕРЕОПРЕДЕЛЕНЫ ЧЕРЕЗ ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
+# ==============================================
+
+# Директория на NFS где webmin сохраняет бэкапы
+BACKUP_DIR="${BACKUP_DIR:-/mnt/nfs-backup}"
+
+# Имя файла бэкапа (или маска)
+# Для использования с wrapper скриптом - будет переопределено
+BACKUP_PATTERN="${BACKUP_PATTERN:-*.sql}"
+
+# Директория для резервных копий (на том же NFS)
+ARCHIVE_DIR="${ARCHIVE_DIR:-/mnt/nfs-backup/archive}"
+
+# Лог файл (может быть переопределен для каждой БД)
+LOG_FILE="${LOG_FILE:-/var/log/mysql_backup_verify.log}"
+
+# Email для уведомлений (опционально, оставьте пустым если не нужно)
+EMAIL_ALERT="${EMAIL_ALERT:-}"
+
+# Максимальный возраст файла для проверки (в минутах)
+MAX_FILE_AGE="${MAX_FILE_AGE:-60}"
+
+# Срок хранения старых копий (в днях)
+RETENTION_DAYS="${RETENTION_DAYS:-30}"
+
+# ==============================================
+# ФУНКЦИИ
+# ==============================================
+
+log_message() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
+
+send_email() {
+    if [ -n "$EMAIL_ALERT" ] && command -v mail &> /dev/null; then
+        echo "$1" | mail -s "MySQL Backup Verification Alert" "$EMAIL_ALERT"
+    fi
+}
+
+# Проверка целостности SQL файла
+verify_sql_file() {
+    local file="$1"
+    local errors=0
+    
+    log_message "Начинаем проверку файла: $(basename $file)"
+    
+    # Проверка 1: Файл не пустой
+    if [ ! -s "$file" ]; then
+        log_message "ОШИБКА: Файл пустой или не существует"
+        return 1
+    fi
+    
+    local file_size=$(stat -f%z "$file" 2>/dev/null || stat -c%s "$file" 2>/dev/null)
+    log_message "Размер файла: $file_size байт ($(numfmt --to=iec-i --suffix=B $file_size 2>/dev/null || echo $file_size))"
+    
+    # Проверка 2: Минимальный размер файла (100KB)
+    if [ "$file_size" -lt 102400 ]; then
+        log_message "ВНИМАНИЕ: Файл слишком маленький (< 100KB), возможно неполный"
+        ((errors++))
+    fi
+    
+    # Проверка 3: Файл должен начинаться с SQL комментария или команды
+    local first_line=$(head -n 1 "$file")
+    if [[ ! "$first_line" =~ ^(--|/\*|CREATE|DROP|USE|INSERT|SET) ]]; then
+        log_message "ОШИБКА: Файл не начинается с валидного SQL"
+        ((errors++))
+    fi
+    
+    # Проверка 4: Проверяем наличие завершающих строк
+    local last_lines=$(tail -n 5 "$file")
+    
+    if [[ "$last_lines" =~ "Dump completed" ]] || \
+       [[ "$last_lines" =~ "-- MySQL dump" ]] || \
+       [[ "$last_lines" =~ "UNLOCK TABLES" ]]; then
+        log_message "✓ Найдены завершающие маркеры дампа"
+    else
+        log_message "ВНИМАНИЕ: Не найдены стандартные завершающие маркеры"
+    fi
+    
+    # Проверка 5: Проверка на незавершенные транзакции
+    if grep -q "ROLLBACK" "$file"; then
+        log_message "ВНИМАНИЕ: Обнаружены ROLLBACK команды"
+        ((errors++))
+    fi
+    
+    # Проверка 6: Базовая проверка SQL синтаксиса (поиск незакрытых кавычек)
+    local single_quotes=$(grep -o "'" "$file" | wc -l)
+    if [ $((single_quotes % 2)) -ne 0 ]; then
+        log_message "ВНИМАНИЕ: Нечетное количество одинарных кавычек - возможно обрыв"
+        ((errors++))
+    fi
+    
+    # Проверка 7: Если файл gzip - проверяем целостность архива
+    if [[ "$file" =~ \.gz$ ]]; then
+        log_message "Проверка целостности GZIP архива..."
+        if gzip -t "$file" 2>/dev/null; then
+            log_message "✓ GZIP архив целый"
+        else
+            log_message "ОШИБКА: GZIP архив поврежден"
+            ((errors++))
+        fi
+    fi
+    
+    # Итоговая проверка
+    if [ $errors -eq 0 ]; then
+        log_message "✓ Все проверки пройдены успешно"
+        return 0
+    else
+        log_message "✗ Обнаружено ошибок: $errors"
+        return 1
+    fi
+}
+
+# Создание резервной копии
+create_backup_copy() {
+    local source_file="$1"
+    local filename=$(basename "$source_file")
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    
+    # Создаем имя для копии
+    local base_name="${filename%.*}"
+    local extension="${filename##*.}"
+    local copy_name="${base_name}_${timestamp}_verified.${extension}"
+    local dest_file="$ARCHIVE_DIR/$copy_name"
+    
+    log_message "Создание копии: $(basename $dest_file)"
+    
+    # Создаем директорию архива если не существует
+    mkdir -p "$ARCHIVE_DIR"
+    
+    # Копируем файл
+    cp -p "$source_file" "$dest_file"
+    
+    if [ $? -eq 0 ]; then
+        local copy_size=$(stat -f%z "$dest_file" 2>/dev/null || stat -c%s "$dest_file" 2>/dev/null)
+        log_message "✓ Копия создана успешно (размер: $(numfmt --to=iec-i --suffix=B $copy_size 2>/dev/null || echo $copy_size))"
+        
+        # Создаем контрольную сумму
+        if command -v md5sum &> /dev/null; then
+            md5sum "$dest_file" > "${dest_file}.md5"
+            log_message "✓ Создана контрольная сумма MD5"
+        fi
+        
+        return 0
+    else
+        log_message "✗ ОШИБКА при создании копии"
+        return 1
+    fi
+}
+
+# Очистка старых копий
+cleanup_old_backups() {
+    local retention_days=${RETENTION_DAYS}
+    
+    log_message "Очистка копий старше $retention_days дней в $ARCHIVE_DIR..."
+    
+    local deleted_count=$(find "$ARCHIVE_DIR" -name "*_verified.*" -type f -mtime +$retention_days -delete -print 2>/dev/null | wc -l)
+    
+    if [ "$deleted_count" -gt 0 ]; then
+        log_message "✓ Удалено старых копий: $deleted_count"
+    else
+        log_message "Старых копий для удаления не найдено"
+    fi
+}
+
+# ==============================================
+# ОСНОВНАЯ ЛОГИКА
+# ==============================================
+
+main() {
+    log_message "=========================================="
+    log_message "Запуск скрипта проверки и копирования бэкапа"
+    log_message "Директория бэкапов: $BACKUP_DIR"
+    log_message "Паттерн поиска: $BACKUP_PATTERN"
+    log_message "Директория архива: $ARCHIVE_DIR"
+    log_message "=========================================="
+    
+    # Проверка что директория существует и доступна
+    if [ ! -d "$BACKUP_DIR" ]; then
+        log_message "КРИТИЧЕСКАЯ ОШИБКА: Директория $BACKUP_DIR не существует!"
+        send_email "КРИТИЧЕСКАЯ ОШИБКА: Директория бэкапов $BACKUP_DIR не доступна на $(hostname)"
+        exit 1
+    fi
+    
+    # Проверка что это NFS (опционально, только если это NFS клиент)
+    # if ! mountpoint -q "$BACKUP_DIR" 2>/dev/null; then
+    #     log_message "ВНИМАНИЕ: $BACKUP_DIR не является точкой монтирования"
+    # fi
+    
+    # Находим последний файл бэкапа
+    local latest_backup=$(find "$BACKUP_DIR" -maxdepth 1 -name "$BACKUP_PATTERN" -type f -mmin -$MAX_FILE_AGE -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+    
+    if [ -z "$latest_backup" ]; then
+        log_message "ВНИМАНИЕ: Не найдены свежие бэкапы (моложе $MAX_FILE_AGE минут)"
+        log_message "Проверяем все файлы в директории..."
+        latest_backup=$(find "$BACKUP_DIR" -maxdepth 1 -name "$BACKUP_PATTERN" -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+        
+        if [ -z "$latest_backup" ]; then
+            log_message "ОШИБКА: Файлы бэкапа не найдены вообще!"
+            send_email "ОШИБКА: Файлы бэкапа MySQL ($BACKUP_PATTERN) не найдены на $(hostname) в $BACKUP_DIR"
+            exit 1
+        fi
+    fi
+    
+    log_message "Найден файл для проверки: $(basename $latest_backup)"
+    
+    # Информация о файле
+    local file_date=$(stat -c %y "$latest_backup" 2>/dev/null || stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "$latest_backup" 2>/dev/null)
+    log_message "Дата создания файла: $file_date"
+    
+    # Быстрая проверка целостности
+    if verify_sql_file "$latest_backup"; then
+        log_message "✓ Базовая проверка пройдена успешно"
+        
+        # Создаем резервную копию
+        if create_backup_copy "$latest_backup"; then
+            log_message "✓ Резервная копия создана успешно"
+            
+            # Очистка старых копий
+            cleanup_old_backups
+            
+            log_message "=========================================="
+            log_message "Скрипт завершен успешно"
+            log_message "=========================================="
+            
+            exit 0
+        else
+            log_message "✗ ОШИБКА при создании копии"
+            send_email "ОШИБКА: Не удалось создать копию бэкапа MySQL на $(hostname)"
+            exit 1
+        fi
+    else
+        log_message "✗ Проверка целостности провалена"
+        send_email "КРИТИЧЕСКАЯ ОШИБКА: Бэкап MySQL $(basename $latest_backup) на $(hostname) поврежден или неполный!"
+        exit 1
+    fi
+}
+
+# Запуск основной функции
+main "$@"
